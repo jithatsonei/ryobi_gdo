@@ -63,25 +63,46 @@ class RyobiDataUpdateCoordinator(DataUpdateCoordinator):
             LOGGER.error("Timed out waiting for websocket to connect; dropping command")
             return
 
-        await ws.send_message(*data)
+        if await ws.send_message(*data):
+            return
 
-    async def _websocket_check(self):
+        LOGGER.warning("Websocket send failed, attempting to reopen connection")
+        await self._websocket_check(force_restart=True)
+
+        ws = self.client.ws
+        if ws is None:
+            LOGGER.error("Websocket client unavailable after reconnect attempt")
+            return
+
+        if not await ws.wait_until_connected(timeout=15):
+            LOGGER.error(
+                "Timed out waiting for websocket to recover after reconnect attempt"
+            )
+            return
+
+        if not await ws.send_message(*data):
+            LOGGER.error("Failed to send command after websocket reconnect")
+
+    async def _websocket_check(self, *, force_restart: bool = False):
         """Handle reconnection of websocket."""
         ws = self.client.ws
-        if ws is not None and ws.state not in ("connected", "starting"):
-            last_seen = (
-                datetime.fromtimestamp(ws.last_msg, tz=UTC).isoformat()
-                if ws.last_msg
-                else "unknown"
-            )
-            LOGGER.warning(
-                "Websocket inactive since %s (listening=%s)",
-                last_seen,
-                ws._state,
-            )
-            # Only close if not already stopped
-            if ws.state != "stopped":
-                await ws.close()
+        if ws is not None:
+            transport_open = ws.has_open_transport()
+            if force_restart or ws.state not in ("connected", "starting") or not transport_open:
+                last_seen = (
+                    datetime.fromtimestamp(ws.last_msg, tz=UTC).isoformat()
+                    if ws.last_msg
+                    else "unknown"
+                )
+                LOGGER.warning(
+                    "Websocket inactive since %s (state=%s transport=%s)",
+                    last_seen,
+                    ws.state,
+                    "open" if transport_open else "closing",
+                )
+                if ws.state != "stopped":
+                    await ws.mark_unavailable("stale transport")
+
         if not self.client.ws_listening:
             LOGGER.debug("Attempting websocket reconnection")
             try:
