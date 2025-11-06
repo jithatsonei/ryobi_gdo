@@ -6,6 +6,7 @@ import asyncio
 from collections import abc
 import json
 import logging
+import time
 
 import aiohttp  # type: ignore
 
@@ -33,7 +34,14 @@ class RyobiWebSocket:
     """Represent a websocket connection to Ryobi servers."""
 
     # FIX: Modified constructor to accept aiohttp session
-    def __init__(self, callback, username: str, apikey: str, device: str, session: aiohttp.ClientSession) -> None:
+    def __init__(
+        self,
+        callback,
+        username: str,
+        apikey: str,
+        device: str,
+        session: aiohttp.ClientSession,
+    ) -> None:
         """Initialize a RyobiWebSocket instance."""
         # FIX: Use the passed session instead of creating a new one
         self.session = session
@@ -46,6 +54,8 @@ class RyobiWebSocket:
         self._error_reason = None
         self._ws_client = None
         self.failed_attempts = 0
+        self._connected_event = asyncio.Event()
+        self.last_msg: float = 0.0
 
     @property
     def state(self) -> str | None:
@@ -59,6 +69,11 @@ class RyobiWebSocket:
         LOGGER.debug("Websocket state: %s", value)
         await self.callback(SIGNAL_CONNECTION_STATE, value, self._error_reason)
         self._error_reason = None
+        if value == STATE_CONNECTED:
+            self._connected_event.set()
+            self.last_msg = time.time()
+        else:
+            self._connected_event.clear()
 
     async def running(self):
         """Open a persistent websocket connection and act on events."""
@@ -90,6 +105,7 @@ class RyobiWebSocket:
 
                     if message.type == aiohttp.WSMsgType.TEXT:
                         msg = message.json()
+                        self.last_msg = time.time()
                         await self.callback("data", msg)
 
                     elif message.type == aiohttp.WSMsgType.CLOSED:
@@ -145,6 +161,9 @@ class RyobiWebSocket:
     async def close(self):
         """Close the listening websocket."""
         await RyobiWebSocket.state.fset(self, STATE_STOPPED)
+        if self._ws_client is not None and not self._ws_client.closed:
+            await self._ws_client.close()
+        self._ws_client = None
 
     async def websocket_auth(self) -> None:
         """Authenticate with Ryobi server."""
@@ -176,12 +195,29 @@ class RyobiWebSocket:
         try:
             await self._ws_client.send_str(json_message)
             LOGGER.debug("Websocket message sent.")
+            self.last_msg = time.time()
             return True
         except Exception as err:
             LOGGER.error("Websocket error sending message: %s", err)
             self._error_reason = err
             await RyobiWebSocket.state.fset(self, STATE_DISCONNECTED)
         return False
+
+    async def wait_until_connected(self, timeout: float | None = None) -> bool:
+        """Wait until the websocket is connected."""
+        if self._state == STATE_CONNECTED:
+            return True
+
+        try:
+            if timeout is None:
+                await self._connected_event.wait()
+            else:
+                await asyncio.wait_for(self._connected_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            LOGGER.warning("Timed out waiting for websocket connection to be ready")
+            return False
+
+        return self._state == STATE_CONNECTED
 
     def redact_api_key(self, message: dict) -> dict:
         """Clear API key data from logs."""

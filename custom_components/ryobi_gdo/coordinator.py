@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import logging
 
+from aiohttp import ClientError
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
@@ -52,18 +54,29 @@ class RyobiDataUpdateCoordinator(DataUpdateCoordinator):
         module = self.client.get_module(device)
         module_type = self.client.get_module_type(device)
         data = (module, module_type, command, value)
-        if self.client.ws is not None:
-            await self.client.ws.send_message(*data)
-        else:
+        ws = self.client.ws
+        if ws is None:
             LOGGER.error("Websocket client is not connected, cannot send command")
+            return
+
+        if not await ws.wait_until_connected(timeout=10):
+            LOGGER.error("Timed out waiting for websocket to connect; dropping command")
+            return
+
+        await ws.send_message(*data)
 
     async def _websocket_check(self):
         """Handle reconnection of websocket."""
         ws = self.client.ws
         if ws is not None and ws.state not in ("connected", "starting"):
+            last_seen = (
+                datetime.fromtimestamp(ws.last_msg, tz=UTC).isoformat()
+                if ws.last_msg
+                else "unknown"
+            )
             LOGGER.warning(
                 "Websocket inactive since %s (listening=%s)",
-                datetime.fromtimestamp(ws.last_msg, tz=UTC).isoformat(),
+                last_seen,
                 ws._state,
             )
             # Only close if not already stopped
@@ -71,7 +84,10 @@ class RyobiDataUpdateCoordinator(DataUpdateCoordinator):
                 await ws.close()
         if not self.client.ws_listening:
             LOGGER.debug("Attempting websocket reconnection")
-            await self.client.ws_connect()
+            try:
+                await self.client.ws_connect()
+            except (ClientError, TimeoutError) as err:
+                LOGGER.error("Error reconnecting websocket: %s", err)
 
     async def websocket_update(self):
         """Trigger processing updated websocket data."""
