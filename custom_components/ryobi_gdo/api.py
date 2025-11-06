@@ -303,6 +303,8 @@ class RyobiApiClient:
 
         LOGGER.debug("Websocket not connected, connecting now...")
         await self.open_websocket()
+        if not await self.ws.wait_until_connected(timeout=10):
+            raise TimeoutError("Timed out waiting for websocket connection to be ready")
 
     async def ws_disconnect(self) -> bool:
         """Disconnect from websocket."""

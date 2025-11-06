@@ -6,6 +6,7 @@ import asyncio
 from collections import abc
 import json
 import logging
+import time
 
 import aiohttp  # type: ignore
 
@@ -33,7 +34,14 @@ class RyobiWebSocket:
     """Represent a websocket connection to Ryobi servers."""
 
     # FIX: Modified constructor to accept aiohttp session
-    def __init__(self, callback, username: str, apikey: str, device: str, session: aiohttp.ClientSession) -> None:
+    def __init__(
+        self,
+        callback,
+        username: str,
+        apikey: str,
+        device: str,
+        session: aiohttp.ClientSession,
+    ) -> None:
         """Initialize a RyobiWebSocket instance."""
         # FIX: Use the passed session instead of creating a new one
         self.session = session
@@ -46,6 +54,8 @@ class RyobiWebSocket:
         self._error_reason = None
         self._ws_client = None
         self.failed_attempts = 0
+        self._connected_event = asyncio.Event()
+        self.last_msg: float = 0.0
 
     @property
     def state(self) -> str | None:
@@ -59,6 +69,11 @@ class RyobiWebSocket:
         LOGGER.debug("Websocket state: %s", value)
         await self.callback(SIGNAL_CONNECTION_STATE, value, self._error_reason)
         self._error_reason = None
+        if value == STATE_CONNECTED:
+            self._connected_event.set()
+            self.last_msg = time.time()
+        else:
+            self._connected_event.clear()
 
     async def running(self):
         """Open a persistent websocket connection and act on events."""
@@ -90,10 +105,19 @@ class RyobiWebSocket:
 
                     if message.type == aiohttp.WSMsgType.TEXT:
                         msg = message.json()
+                        self.last_msg = time.time()
                         await self.callback("data", msg)
 
-                    elif message.type == aiohttp.WSMsgType.CLOSED:
-                        LOGGER.warning("Websocket connection closed")
+                    elif message.type in (
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.CLOSING,
+                        aiohttp.WSMsgType.CLOSED,
+                    ):
+                        LOGGER.warning(
+                            "Websocket connection closing (%s): %s",
+                            message.type,
+                            getattr(message, "extra", None),
+                        )
                         break
 
                     elif message.type == aiohttp.WSMsgType.ERROR:
@@ -144,6 +168,9 @@ class RyobiWebSocket:
 
     async def close(self):
         """Close the listening websocket."""
+        if self._state == STATE_STOPPED:
+            return
+        await self._mark_transport_unavailable()
         await RyobiWebSocket.state.fset(self, STATE_STOPPED)
 
     async def websocket_auth(self) -> None:
@@ -173,28 +200,52 @@ class RyobiWebSocket:
         json_message = json.dumps(message)
         LOGGER.debug("Websocket sending data: %s", self.redact_api_key(message))
 
+        if not self._transport_ready():
+            LOGGER.warning(
+                "Websocket transport unavailable while sending message (state=%s)",
+                self._state,
+            )
+            await self._mark_transport_unavailable("transport closing")
+            return False
+
         try:
             await self._ws_client.send_str(json_message)
             LOGGER.debug("Websocket message sent.")
+            self.last_msg = time.time()
             return True
         except Exception as err:
             LOGGER.error("Websocket error sending message: %s", err)
-            self._error_reason = err
-            await RyobiWebSocket.state.fset(self, STATE_DISCONNECTED)
+            await self._mark_transport_unavailable(err)
         return False
 
-    def redact_api_key(self, message: dict) -> dict:
+    async def wait_until_connected(self, timeout: float | None = None) -> bool:
+        """Wait until the websocket is connected."""
+        if self._state == STATE_CONNECTED:
+            return True
+
+        try:
+            if timeout is None:
+                await self._connected_event.wait()
+            else:
+                await asyncio.wait_for(self._connected_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            LOGGER.warning("Timed out waiting for websocket connection to be ready")
+            return False
+
+        return self._state == STATE_CONNECTED and self._transport_ready()
+
+    def redact_api_key(self, message: dict) -> str:
         """Clear API key data from logs."""
         if "params" in message:
             if "apiKey" in message["params"]:
                 message["params"]["apiKey"] = ""
         return json.dumps(message)
 
-    async def send_message(self, *args):
+    async def send_message(self, *args) -> bool:
         """Send message to API."""
-        if self._state != STATE_CONNECTED:
+        if self._state != STATE_CONNECTED or not self._transport_ready():
             LOGGER.warning("Websocket not yet connected, unable to send command.")
-            return
+            return False
 
         LOGGER.debug("Send message args: %s", args)
 
@@ -217,4 +268,48 @@ class RyobiWebSocket:
             args[1],
         )
         LOGGER.debug("Full message: %s", ws_command)
-        await self.websocket_send(ws_command)
+        return await self.websocket_send(ws_command)
+
+    def _transport_ready(self) -> bool:
+        """Return True if the websocket transport appears open."""
+        if self._ws_client is None:
+            return False
+        if self._ws_client.closed:
+            return False
+        if getattr(self._ws_client, "_closing", False):
+            return False
+        conn = getattr(self._ws_client, "_conn", None)
+        transport = getattr(conn, "transport", None)
+        if transport is not None and transport.is_closing():
+            return False
+        return True
+
+    async def _mark_transport_unavailable(self, reason: str | Exception | None = None) -> None:
+        """Mark the websocket transport as unavailable and update state."""
+        if self._state == STATE_STOPPED:
+            return
+
+        if reason is not None:
+            self._error_reason = reason
+
+        client = self._ws_client
+        self._ws_client = None
+        if client is not None:
+            try:
+                if not client.closed:
+                    await client.close()
+            except Exception as close_err:  # pragma: no cover - best effort cleanup
+                LOGGER.debug("Error closing websocket client: %s", close_err)
+
+        self.last_msg = 0.0
+
+        if self._state != STATE_STOPPED:
+            await RyobiWebSocket.state.fset(self, STATE_DISCONNECTED)
+
+    def has_open_transport(self) -> bool:
+        """Return True if the websocket transport is currently available."""
+        return self._transport_ready()
+
+    async def mark_unavailable(self, reason: str | Exception | None = None) -> None:
+        """Public helper to mark the websocket as unavailable."""
+        await self._mark_transport_unavailable(reason)
