@@ -172,6 +172,9 @@ class RyobiWebSocket:
             return
         await self._mark_transport_unavailable()
         await RyobiWebSocket.state.fset(self, STATE_STOPPED)
+        if self._ws_client is not None and not self._ws_client.closed:
+            await self._ws_client.close()
+        self._ws_client = None
 
     async def websocket_auth(self) -> None:
         """Authenticate with Ryobi server."""
